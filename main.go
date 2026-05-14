@@ -7,12 +7,22 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/lipgloss"
 )
+
+type clearStatusMsg struct{}
+
+func clearStatusAfter(d time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(d)
+		return clearStatusMsg{}
+	}
+}
 
 type mode int
 
@@ -41,9 +51,10 @@ type SymbolOut struct {
 	Index2D Idx2D `json:"i2d"`
 }
 
-type Idx2D struct {
-	X int `json:"x"`
-	Y int `json:"y"`
+type Idx2D [2]int
+
+func (idx Idx2D) MarshalText() ([]byte, error) {
+	return []byte(fmt.Sprintf("[%d,%d]", idx[0], idx[1])), nil
 }
 
 type model struct {
@@ -56,6 +67,8 @@ type model struct {
 	ids         []int32
 	showJSON    bool
 	finalOutput string // 儲存最終 JSON 避免 View 被重複計算
+	warnMsg     string
+	copyMsg     string
 
 	inputMode mode
 	textInput textinput.Model
@@ -76,7 +89,7 @@ func initialModel(layout []int) model {
 	for x, rows := range layout {
 		grid[x] = make([]*Symbol, rows)
 		for y := range rows {
-			grid[x][y] = &Symbol{ID: 92, BT: 0, X: x, Y: y}
+			grid[x][y] = &Symbol{ID: 92, BT: 0, X: x, Y: y, Width: 1, Length: 1}
 		}
 	}
 
@@ -127,6 +140,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	switch msg := msg.(type) {
+	case clearStatusMsg:
+		m.warnMsg = ""
+		m.copyMsg = ""
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "s":
@@ -166,17 +183,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "enter":
-			m.showJSON = true
-			m.finalOutput = m.generateJSON()
-			return m, tea.Quit
+			json := m.generateJSON()
+			if err := clipboard.WriteAll(json); err != nil {
+				m.copyMsg = "❌ 複製失敗"
+			} else {
+				m.copyMsg = "✅ 已複製到剪貼簿"
+			}
+			return m, clearStatusAfter(2 * time.Second)
 		}
 		switch msg.Key().Code {
 		case tea.KeySpace:
-			target := m.grid[m.cursorX][m.cursorY]
+			m.warnMsg = ""
+			cx, cy := m.cursorX, m.cursorY
+			w, l := m.selectedW, m.selectedL
+			// 邊界檢查：x 方向 width，y 方向 length
+			if cx+w > len(m.layout) {
+				m.warnMsg = fmt.Sprintf("⚠️  超出範圍：X 方向需要 %d 格，但只剩 %d 格", w, len(m.layout)-cx)
+				return m, clearStatusAfter(2 * time.Second)
+			}
+			for dx := 0; dx < w; dx++ {
+				if cy+l > m.layout[cx+dx] {
+					m.warnMsg = fmt.Sprintf("⚠️  超出範圍：Y 方向需要 %d 格，但 reel %d 只剩 %d 格", l, cx+dx, m.layout[cx+dx]-cy)
+					return m, clearStatusAfter(2 * time.Second)
+				}
+			}
+			if m.warnMsg != "" {
+				break
+			}
+			// 先把佔用區域全設為 0（蓋掉）
+			for dx := 0; dx < w; dx++ {
+				for dy := 0; dy < l; dy++ {
+					if dx == 0 && dy == 0 {
+						continue
+					}
+					m.grid[cx+dx][cy+dy].ID = 0
+					m.grid[cx+dx][cy+dy].BT = 0
+					m.grid[cx+dx][cy+dy].Width = 1
+					m.grid[cx+dx][cy+dy].Length = 1
+				}
+			}
+			target := m.grid[cx][cy]
 			target.ID = m.selectedID
 			target.BT = m.selectedBT
-			target.Width = m.selectedW
-			target.Length = m.selectedL
+			target.Width = w
+			target.Length = l
 		}
 	}
 	return m, nil
@@ -196,7 +246,7 @@ func (m model) generateJSON() string {
 					Length:  s.Length,
 					Width:   s.Width,
 					Index:   int32(idxCounter),
-					Index2D: Idx2D{X: x, Y: y},
+					Index2D: [2]int{x, y},
 				}
 			}
 			idxCounter++
@@ -259,8 +309,27 @@ func (m model) View() tea.View {
 		}
 		columns = append(columns, lipgloss.JoinVertical(lipgloss.Left, colCells...))
 	}
-	s := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
-	return tea.NewView(head + "\n\n" + s)
+	grid := lipgloss.JoinHorizontal(lipgloss.Top, columns...)
+
+	// preview 框：顯示 cursor 所在 symbol 資訊
+	curSym := m.grid[m.cursorX][m.cursorY]
+	previewContent := fmt.Sprintf("ID: %d\nBT: %d\nW:  %d\nL:  %d", curSym.ID, curSym.BT, curSym.Width, curSym.Length)
+	preview := lipgloss.NewStyle().
+		Width(12).
+		Padding(0, 1).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("201")).
+		Render(previewContent)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, grid, "  ", preview)
+
+	status := ""
+	if m.warnMsg != "" {
+		status = "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(m.warnMsg)
+	} else if m.copyMsg != "" {
+		status = "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Render(m.copyMsg)
+	}
+	return tea.NewView(head + "\n\n" + body + status)
 }
 
 func main() {
