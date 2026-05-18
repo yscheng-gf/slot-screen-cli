@@ -1,4 +1,4 @@
-module slot-screen-cli
+module github.com/yscheng-gf/slot-screen-cli
 
 go 1.25.9
 
