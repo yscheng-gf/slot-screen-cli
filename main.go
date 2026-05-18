@@ -48,7 +48,7 @@ type SymbolOut struct {
 	Length  int   `json:"l"`
 	Width   int   `json:"w"`
 	Index   int32 `json:"i"`
-	Index2D Idx2D `json:"i2d"`
+	Index2D Idx2D `json:"-"`
 }
 
 type Idx2D [2]int
